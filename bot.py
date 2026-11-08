@@ -18,13 +18,14 @@ bot = telebot.TeleBot(BOT_TOKEN)
 MAX_TOOL_ITERATIONS = 5  # safety cap so a confused model can't loop forever
 
 ### Scheduler Setup
-def say_hi():
-    print("hi from a persisted job")
-
 jobstores = {'default': SQLAlchemyJobStore(url='sqlite:///jobs.sqlite')}
 scheduler = BackgroundScheduler(jobstores=jobstores)
-scheduler.add_job(say_hi, 'interval', seconds=10, id='test_job', replace_existing=True)
 scheduler.start()
+# the old 10-second test job is persisted in jobs.sqlite; clear it out
+try:
+    scheduler.remove_job('test_job')
+except Exception:
+    pass
 
 ### Basic utility function to call the Ollama API
 def get_llm_response(message: str) -> str:
@@ -48,48 +49,69 @@ def get_llm_response(message: str) -> str:
 def call_llm(message):
     run_llm_pipeline(message.text, message.chat.id)
 
-### Runs a tool-calling loop: keeps calling the model and executing whatever
-### tools it requests (read_tasks, add_task, complete_task, delete_task,
-### modify_task) until it responds with plain text instead of a tool call,
-### or until MAX_TOOL_ITERATIONS is hit.
-def run_llm_pipeline(user_text: str, chat_id: int):
+def build_seed_prompt(scheduled: bool, user_text: str) -> str:
     now = datetime.now()
     date_context = f"Today is {now.strftime('%A, %Y-%m-%d')}, and the current time is {now.strftime('%H:%M:%S')}."
-    print(chat_id)
-    seed_prompt = (
+
+    persona = (
         f"{date_context} "
-        "You are a helpful assistant whose sole purpose is to help me remember what tasks "
+        "You are an assistant whose sole purpose is to help me remember what tasks "
         "I need to get done and motivate me to do it. Don't use any emoticons or emojis in your responses, "
         "keep them concise, and be serious. Act like the man in the chair in spy movies. "
-        "We are texting, so keep your responses short and to the point. You have access to these tools: "
+        "We are texting, so keep your responses short and to the point. "
+    )
+
+    if scheduled:
+        return (
+            persona
+            + "This is an AUTOMATIC scheduled check-in. I did not just send you a message; "
+            "a timer you set earlier has fired, so you are the one initiating contact. "
+            f"The purpose of this check-in is: {user_text}. "
+            "Call read_tasks to see my pending tasks, then text me a short message reminding me "
+            "of what is outstanding and asking for a status update. If there are no pending tasks, "
+            "ask what I want to get done. Do not add, change, complete, or delete anything, "
+            "and do not schedule anything. Always finish with a plain text message to me."
+        )
+
+    return (
+        persona
+        + "You have access to these tools. "
+        "TASKS are things I need to do. JOBS are scheduled check-ins: reminders you send me later. "
+        "Never confuse the two. Adding a task does NOT schedule a reminder, and scheduling a reminder "
+        "does NOT add a task. Only do what I actually asked for. "
+        "Task tools: "
         "read_tasks: use when I ask what tasks I have pending. "
         "add_task: use when I ask you to add, create, or remember a new task. "
         "complete_task: use when I say I've finished or done a task. "
         "delete_task: use when I ask to remove, delete, or abandon a task. "
-        "modify_task: use when I ask to change, update, or reschedule a task. "
-        "read_jobs: use when I ask what reminders or check-ins I have scheduled "
-        "(e.g. 'what reminders do I have', 'when's my next check-in'). "
-        "Do not confuse this with read_tasks — tasks are things I need to do, "
-        "jobs are reminders you've scheduled to message me about them. "
-        "create_onetime_job: use when I ask to be reminded about something once, "
-        "at a specific time or after a delay (e.g. 'remind me in 2 hours', "
-        "'remind me tomorrow at 5pm'). "
-        "create_recurring_job: use when I ask to be reminded of something every "
-        "day at the same time (e.g. 'remind me of my tasks every day at 8am'). "
-        "Never confuse the two — a reminder that repeats daily must use "
-        "create_recurring_job, not create_onetime_job, even if I only mention one day first. "
+        "modify_task: use when I ask to change, update, or edit a task. "
+        "Job tools: "
+        "read_jobs: use when I ask what reminders or check-ins I have scheduled. "
+        "create_onetime_job: use when I ask to be reminded once, at a specific time or after a delay "
+        "(e.g. 'remind me in 2 hours', 'remind me tomorrow at 5pm'). "
+        "create_recurring_job: use when I ask to be reminded every day at the same time "
+        "(e.g. 'check in with me every day at 8am'). A reminder that repeats daily must use "
+        "create_recurring_job, even if I only mention one day first. "
         "complete_task, delete_task, and modify_task all require the task's numeric id. "
-        "read_tasks is ONLY a lookup step — it is never a final answer on its own. "
-        "Whenever my message implies an action (completing, deleting, or changing a task), "
-        "you must end your turn by actually calling complete_task, delete_task, or modify_task "
-        "with the matching id. Do not just summarize, list, or describe the task back to me — "
-        "that is not a valid response to a request to complete, delete, or modify something. "
-        "If you don't already know the id, call read_tasks first, then immediately follow up "
-        "with the correct action tool using the id you found."
+        "read_tasks is ONLY a lookup step, never a final answer on its own. "
+        "Whenever my message implies completing, deleting, or changing a task, you must end by "
+        "actually calling complete_task, delete_task, or modify_task with the matching id. "
+        "If you don't know the id, call read_tasks first, then immediately call the action tool. "
+        "Now here is my message: " + user_text
     )
 
-    input_text = seed_prompt + " Now here is my message: " + user_text
-    messages = [{"role": "user", "content": input_text}]
+
+### Entry point for scheduled jobs: runs the pipeline in "system-initiated" mode
+def run_scheduled_checkin(title: str, chat_id):
+    run_llm_pipeline(title, chat_id, scheduled=True)
+
+
+### Runs a tool-calling loop: keeps calling the model and executing whatever
+### tools it requests until it responds with plain text instead of a tool call,
+### or until MAX_TOOL_ITERATIONS is hit.
+### scheduled=True means a job fired (System -> User); False means the user texted us.
+def run_llm_pipeline(user_text: str, chat_id, scheduled: bool = False):
+    messages = [{"role": "user", "content": build_seed_prompt(scheduled, user_text)}]
 
     available_tools = {
         "read_tasks": read_tasks,
@@ -97,8 +119,12 @@ def run_llm_pipeline(user_text: str, chat_id: int):
         "complete_task": complete_task,
         "delete_task": delete_task,
         "modify_task": modify_task,
-        "read_jobs": read_jobs
+        "read_jobs": read_jobs,
+        "create_recurring_job": create_recurring_job,
+        "create_onetime_job": create_onetime_job,
     }
+    if scheduled:
+        available_tools = {"read_tasks": read_tasks}
     tools = list(available_tools.values())
 
     response = None
@@ -168,7 +194,7 @@ def create_recurring_job(title: str, hour: int, minute: int) -> str:
             Default to 0 if not specified.
     """
     job = scheduler.add_job(
-        run_llm_pipeline,
+        run_scheduled_checkin,
         trigger="cron",
         hour=hour,
         minute=minute,
@@ -196,7 +222,7 @@ def create_onetime_job(title: str, run_date: str) -> str:
             next day's date at 17:00:00).
     """
     job = scheduler.add_job(
-        run_llm_pipeline,
+        run_scheduled_checkin,
         trigger="date",
         run_date=run_date,
         args=[title, TELEGRAM_CHAT_ID],
